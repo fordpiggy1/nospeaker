@@ -64,11 +64,16 @@ cd nospeaker
 ./nospeaker "hello there"            say anything
 ./nospeaker --voice Daniel "hello"   in another macOS voice
 ./nospeaker --sweep                  a rising tone, 100 Hz to 4 kHz
+./nospeaker --audio "song.mp3"        play a local audio file through the trackpad
+./nospeaker --volume 25 --sweep      run a quieter sweep
 
+--volume 25                          motor strength in percent (0–100, default 100)
 --dark                               white on black
 --plain                              no visuals, plain text
 --external                           play through an external Magic Trackpad
 ```
+
+Use `--audio "song.wav" --volume 15` for quieter file playback. The volume setting also applies to speech and the demo. Audio files use macOS decoding. The trackpad plays an approximation of the recording using a few tones at a time between 100 Hz and 4 kHz.
 
 ## 04 / needs
 
