@@ -7,6 +7,7 @@
 //   nospeaker                      the show: about a minute and a half, in the terminal
 //   nospeaker "any words"          say something
 //   nospeaker --sweep              a rising tone from 100 Hz to 4 kHz
+//   nospeaker --audio "song.mp3" --volume 25
 //   options                        --voice <name> (any voice from `say -v '?'`), --dark, --plain, --external
 //
 // How it talks: macOS's own voice (`say`) speaks the line into memory. Every 10 ms, linear prediction finds
@@ -17,6 +18,7 @@
 // Private API: MultitouchSupport is undocumented and may change with any macOS update. The motor is never
 // driven past its normal maximum.
 
+import Accelerate
 import AVFoundation
 import CoreAudio
 import Darwin
@@ -176,21 +178,24 @@ func openMotor() -> CFTypeRef {
 var motor: CFTypeRef?
 var motorPointer: UnsafeMutableRawPointer?
 
+var volume: Float = 1
+
 /// Plays tones (Hz, relative strength) together for `ms` at overall `level` (0…1). Strengths are scaled to
 /// add up to 1: past that is louder, but the driver starts stalling on long runs.
 func play(_ tones: [(hz: Double, amp: Double)], ms: Double, level: Float) {
-    guard let motorPointer, !tones.isEmpty else { return }
+    let motorLevel = min(1, max(0, level)) * volume
+    guard let motorPointer, !tones.isEmpty, motorLevel > 0 else { return }
     let sum = max(tones.reduce(0) { $0 + $1.amp }, 0.0001)
     let shape: [String: Any] = [
         "BaseWaveform": ["Type": "Gaussian", "Amplitude": 0.0, "DurationMS": ms],
         "Tones": tones.map { ["Type": "Sine", "Amplitude": $0.amp / sum, "DurationMS": ms, "DelayMS": 0.0, "FrequencykHz": $0.hz / 1000] },
     ]
     guard let act = actuationCreate!(shape as CFDictionary, 0) else { return }
-    _ = actuationPlay!(act, motorPointer, 0, min(1, max(0, level)), 0)
+    _ = actuationPlay!(act, motorPointer, 0, motorLevel, 0)
     Unmanaged<AnyObject>.fromOpaque(act).release()
     let first = tones[0].hz
     live {
-        $0.actuations += 1; $0.hz = first; $0.level = Double(level); $0.lastPlay = now()
+        $0.actuations += 1; $0.hz = first; $0.level = Double(motorLevel); $0.lastPlay = now()
     }
 }
 
@@ -459,6 +464,94 @@ func voiceTones(_ f: Frame) -> [(hz: Double, amp: Double)] {
     let w = [f.amps[0], f.amps[1] * 1.8]
     let sum = max(w[0] + w[1], 1e-9)
     return [(f.formants[0], w[0] / sum), (f.formants[1], w[1] / sum)]
+}
+
+// MARK: - Audio-file playback
+
+/// Extracts a few audible tones per frame for the motor's sine-tone interface.
+func playAudioFile(_ file: AVAudioFile) throws {
+    let rate = file.processingFormat.sampleRate
+    guard rate.isFinite, rate >= 125, rate <= 768_000 else {
+        fail("The file has an unsupported sample rate.", headline: "nospeaker couldn't play the file.")
+    }
+    let framesPerChunk = Int((rate * 0.032).rounded())
+    let fftOrder = vDSP_Length(ceil(log2(Double(framesPerChunk * 2))))
+    let fftSize = 1 << Int(fftOrder)
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                       frameCapacity: AVAudioFrameCount(framesPerChunk)),
+          let channels = buffer.floatChannelData,
+          let fft = vDSP_create_fftsetup(fftOrder, FFTRadix(kFFTRadix2)) else {
+        fail("Couldn’t prepare the audio file.", headline: "nospeaker couldn't play the file.")
+    }
+    defer { vDSP_destroy_fftsetup(fft) }
+
+    let channelCount = Int(file.processingFormat.channelCount)
+    let binWidth = rate / Double(fftSize)
+    let lowBin = max(1, Int(ceil(100 / binWidth)))
+    let highBin = min(fftSize / 2 - 1, Int(floor(4000 / binWidth)))
+    var real = [Float](repeating: 0, count: fftSize)
+    var imaginary = real
+    let window = (0..<framesPerChunk).map { Float(0.5 - 0.5 * cos(2 * .pi * Double($0) / Double(framesPerChunk))) }
+    var start: UInt64?
+    var framesPlayed = 0
+
+    let totalFrames = file.length
+    while file.framePosition < totalFrames, !interrupted() {
+        let remaining = totalFrames - file.framePosition
+        try file.read(into: buffer, frameCount: AVAudioFrameCount(min(Int64(framesPerChunk), remaining)))
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { break }
+
+        var energy: Float = 0
+        for index in real.indices {
+            var sample: Float = 0
+            if index < frameCount {
+                for channel in 0..<channelCount {
+                    sample += channels[channel][index]
+                }
+                sample /= Float(channelCount)
+                energy += sample * sample
+            }
+            real[index] = index < frameCount ? sample * window[index] : 0
+            imaginary[index] = 0
+        }
+
+        let rms = sqrt(energy / Float(frameCount))
+        var tones: [(hz: Double, amp: Double)] = []
+        if rms > 0.001, lowBin <= highBin {
+            real.withUnsafeMutableBufferPointer { real in
+                imaginary.withUnsafeMutableBufferPointer { imaginary in
+                    var spectrum = DSPSplitComplex(realp: real.baseAddress!, imagp: imaginary.baseAddress!)
+                    vDSP_fft_zip(fft, &spectrum, 1, fftOrder, FFTDirection(FFT_FORWARD))
+                }
+            }
+            let power = (lowBin - 1...highBin + 1).map { bin in
+                real[bin] * real[bin] + imaginary[bin] * imaginary[bin]
+            }
+            let peaks = (1..<(power.count - 1)).filter { bin in
+                power[bin] > power[bin - 1] && power[bin] >= power[bin + 1]
+            }.sorted { power[$0] > power[$1] }
+            if let strongest = peaks.first {
+                for bin in peaks.prefix(4) where power[bin] >= power[strongest] * 0.01 {
+                    let left = power[bin - 1], center = power[bin], right = power[bin + 1]
+                    let offset = Double(0.5 * (left - right) / (left - 2 * center + right))
+                    let frequency = (Double(bin + lowBin - 1) + offset) * binWidth
+                    tones.append((min(4000, max(100, frequency)), Double(sqrt(center))))
+                }
+            }
+        }
+
+        let playbackStart = start ?? mach_absolute_time()
+        start = playbackStart
+        let deadline = playbackStart + UInt64(Double(framesPlayed) / rate * ticksPerSecond)
+        waitUntil(deadline)
+        if interrupted() { break }
+        play(tones, ms: Double(frameCount) / rate * 1000, level: min(1, rms * 3))
+        framesPlayed += frameCount
+    }
+    if let start, !interrupted() {
+        waitUntil(start + UInt64(Double(framesPlayed) / rate * ticksPerSecond))
+    }
 }
 
 // MARK: - Live state shared with the screen
@@ -1549,6 +1642,8 @@ if flag("--help") || flag("-h") {
       nospeaker                         the show (space skips a part, q goes to the end)
       nospeaker "any words"             just say something
       nospeaker --sweep                 a rising tone, 100 Hz to 4 kHz
+      nospeaker --audio "song.mp3"       play an audio file through the trackpad
+      --volume 25                       motor strength in percent (0–100, default 100)
       --voice Daniel                    any voice from `say -v '?'`
       --dark                            white on black instead of black on white
       --plain                           no visuals
@@ -1568,7 +1663,26 @@ applyTheme(light: !flag("--dark"))
 let plain = flag("--plain")
 let wantsSweep = flag("--sweep")
 preferExternal = flag("--external")
+let audioPath = option("--audio", example: "song.mp3")
+if let value = option("--volume", example: "25") {
+    guard let percent = Float(value), (0...100).contains(percent) else {
+        usageError("--volume must be a number from 0 to 100.")
+    }
+    volume = percent / 100
+}
 if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
+var audioFile: AVAudioFile?
+if let audioPath {
+    guard !wantsSweep, voiceName == nil, args.isEmpty else {
+        usageError("--audio cannot be combined with speech or --sweep.")
+    }
+    do {
+        audioFile = try AVAudioFile(forReading: URL(fileURLWithPath: audioPath),
+                                    commonFormat: .pcmFormatFloat32, interleaved: false)
+    } catch {
+        fail("\(audioPath)\n\(error.localizedDescription)", headline: "nospeaker couldn't open the audio file.")
+    }
+}
 
 signal(SIGINT) { _ in requestEnd() }
 signal(SIGTERM) { _ in stopRequested = true }
@@ -1577,7 +1691,14 @@ atexit { restoreTerminal() }
 motor = openMotor()
 motorPointer = Unmanaged.passUnretained(motor! as AnyObject).toOpaque()
 
-if wantsSweep || !args.isEmpty {
+if let audioFile {
+    print("Playing \(audioFile.url.lastPathComponent) through the trackpad. Ctrl-C to stop.")
+    do {
+        try playAudioFile(audioFile)
+    } catch {
+        fail(error.localizedDescription, headline: "nospeaker couldn't read the audio file.")
+    }
+} else if wantsSweep || !args.isEmpty {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
     if wantsSweep { print("sweeping 100 Hz → 4 kHz…"); sweep(seconds: 5) }
     if !args.isEmpty {
